@@ -1,4 +1,4 @@
-# OrchestrAI
+#                                  OrchestrAI
 ### Agentic AI-Powered Technology Intelligence & Research Automation Platform
 
 <p align="center">
