@@ -1,0 +1,82 @@
+%% ============================================================================
+%% ORCHESTRAI — LangGraph Workflow (agent-graph.mmd)
+%% Companion to docs/spec/orchestrai-spec.md (sections 12-13)
+%%
+%% Diagram 1: full research workflow with conditional routing (supervisor).
+%% Diagram 2: node failure/retry policy inside every agent node.
+%% ============================================================================
+
+%% ------------------------- Diagram 1: Main workflow -------------------------
+
+flowchart LR
+
+    START([START]) --> QUND["Query Understanding<br/>intent + query type<br/>Haiku L1"]
+
+    QUND --> ROUTER["Model Router<br/>complexity-aware choice"]
+    ROUTER --> ORCH["Orchestrator / Supervisor<br/>build plan: agents, filters, top_k, depth"]
+
+    ORCH --> RETR{"evidence needed?"}
+    RETR -- yes --> RETRA["Retrieval Agent<br/>expand query, filters,<br/>Qdrant search, evidence manifest"]
+    RETR -- no --> SYNTH["Knowledge Synthesis<br/>Sonnet L2 / Opus L3"]
+
+    ORCH --> ANL{"analysis needed?"}
+    ANL -- yes --> ANALA["Analysis Agent<br/>findings, comparisons,<br/>citations"]
+    ANL -- no --> SYNTH
+
+    ORCH --> TRND{"trends needed?"}
+    TRND -- yes --> TRENDA["Trend Agent<br/>deterministic signals +<br/>interpretation"]
+    TRND -- no --> SYNTH
+
+    RETRA --> KNOW{"chunks above threshold?"}
+    KNOW -- yes --> ANL
+    KNOW -- no --> INSUF["Insufficient-knowledge close<br/>status completed + flag"]
+    ANALA --> TRND
+    TRENDA --> SYNTH
+    INSUF --> ENDX([END])
+
+    SYNTH --> ORCHREV{"Orchestrator review<br/>complete and grounded?"}
+    ORCHREV -- incomplete, one retry left --> RETRA
+    ORCHREV -- ok --> REPORTA["Report Agent<br/>10-section template,<br/>recommendations, references"]
+
+    REPORTA --> PERSIST["Persist: report + insights<br/>+ trends + agent_runs"]
+    PERSIST --> ENDX
+
+    %% Shared state annotation
+    subgraph STATE ["Shared ResearchState (typed, single writer)"]
+        S1["query, query_type, intent, plan, filters"]
+        S2["retrieved_chunks, evidence_manifest"]
+        S3["analyses, trends, signal_components"]
+        S4["synthesis, report, status, current_stage, errors"]
+    end
+
+    ORCH -. reads/writes .-> STATE
+    RETRA -. reads/writes .-> STATE
+    ANALA -. reads/writes .-> STATE
+    TRENDA -. reads/writes .-> STATE
+    SYNTH -. reads/writes .-> STATE
+    REPORTA -. reads/writes .-> STATE
+
+%% ------------------------- Diagram 2: Agent node wrapper -------------------------
+
+flowchart TD
+
+    A([Node invoked<br/>with ResearchState]) --> LOG1["agent_runs row:<br/>status=running, start time"]
+    LOG1 --> TRY1["execute node task<br/>per its typed contract"]
+    TRY1 --> SUCC{"success?"}
+    SUCC -- yes --> LOG2["agent_runs row:<br/>status=completed, output,<br/>model, latency"]
+    LOG2 --> RETN["write output to state<br/>return to graph"]
+
+    SUCC -- no --> E1{"error class?"}
+    E1 -- transient LLM --> RETRY["retry<br/>exponential backoff<br/>max 3"]
+    RETRY --> TRY1
+    E1 -- persistent LLM --> FALLBACK["model fallback<br/>per chain"]
+    FALLBACK --> TRY1
+    E1 -- provider down --> NOTIFY["notify orchestrator<br/>controlled error in state"]
+    E1 -- validation --> NOTIFY
+
+    RETRY -- exhausted --> FAILLOG["agent_runs row:<br/>status=failed, error_message"]
+    NOTIFY --> FAILLOG
+    FAILLOG --> ORCHN["Orchestrator decides:<br/>skip node / re-route /<br/>fail run gracefully"]
+    ORCHN --> ENDN([END])
+
+%% Diagram 1 legend: every node writes an agent_runs row through the Diagram 2 wrapper.

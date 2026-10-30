@@ -1,0 +1,324 @@
+// ============================================================================
+// ORCHESTRAI — Database Schema (PostgreSQL 16)
+// Companion to docs/spec/orchestrai-spec.md (section 8)
+// Conventions:
+//   - PK: uuid default gen_random_uuid()
+//   - user-owned tables carry user_id (multi-user, single-tenant)
+//   - enums are stored as text with CHECK constraints expressed via DBML enum
+//   - Qdrant holds vectors + chunk text + denormalized payload; PostgreSQL
+//     stores source metadata and chunk metadata (document_chunks.vector_id
+//     links to the Qdrant point id)
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum user_status {
+  active
+  disabled
+}
+
+enum source_type {
+  research_paper
+  patent
+  technical_report
+  news
+  user_upload
+}
+
+enum ingestion_status {
+  received
+  validated
+  extracted
+  cleaned
+  normalized
+  chunked
+  embedded
+  indexed
+  failed
+}
+
+enum query_type {
+  literature_search
+  comparison
+  trend_analysis
+  research_summary
+  report_generation
+  decision_support
+}
+
+enum research_status {
+  queued
+  running
+  completed
+  failed
+  cancelled
+}
+
+enum insight_category {
+  finding
+  trend
+  opportunity
+  risk
+  comparison
+  recommendation
+}
+
+enum report_type {
+  research_report
+  literature_summary
+  comparison_report
+  trend_report
+  decision_brief
+}
+
+enum agent_run_status {
+  queued
+  running
+  completed
+  failed
+  skipped
+}
+
+enum feedback_type {
+  thumbs
+  rating
+  comment
+  source_relevance
+}
+
+// ---------------------------------------------------------------------------
+// Tables
+// ---------------------------------------------------------------------------
+
+Table users {
+  id            uuid            [pk, default: `gen_random_uuid()`]
+  email         varchar(255)    [not null, unique]
+  password_hash varchar(255)    [not null]
+  full_name     varchar(120)
+  status        user_status     [not null, default: 'active']
+  is_active     boolean         [not null, default: true]
+  created_at    timestamp       [not null, default: `now()`]
+  updated_at    timestamp       [not null, default: `now()`]
+}
+
+Table research_projects {
+  id          uuid            [pk, default: `gen_random_uuid()`]
+  user_id     uuid            [not null, ref: > users.id]
+  title       varchar(255)    [not null]
+  description text
+  created_at  timestamp       [not null, default: `now()`]
+  updated_at  timestamp       [not null, default: `now()`]
+
+  indexes {
+    user_id
+  }
+}
+
+Table research_queries {
+  id                  uuid            [pk, default: `gen_random_uuid()`]
+  user_id             uuid            [not null, ref: > users.id]
+  project_id          uuid            [ref: > research_projects.id] // nullable = ad-hoc
+  query_text          text            [not null]
+  query_type          query_type
+  intent              varchar(120)    // detected intent label
+  status              research_status [not null, default: 'queued']
+  current_stage       varchar(120)    // last completed graph node
+  model_preference    varchar(20)     // auto|haiku|sonnet|opus
+  filters             jsonb           // applied source/date filters snapshot
+  insufficient_knowledge boolean      [not null, default: false]
+  error               text
+  created_at          timestamp       [not null, default: `now()`]
+  started_at          timestamp
+  completed_at        timestamp
+
+  indexes {
+    user_id
+    project_id
+    (user_id, status)
+    created_at
+  }
+}
+
+Table documents {
+  id               uuid            [pk, default: `gen_random_uuid()`]
+  user_id          uuid            [not null, ref: > users.id]
+  source_type      source_type     [not null]
+  title            varchar(500)
+  authors          jsonb           // string[] when parsed
+  publication_year integer
+  publication_date date
+  url              varchar(1000)
+  external_id      varchar(255)    // DOI / patent number / news id (imports)
+  source_name      varchar(255)    // venue / journal / site / publisher
+  abstract         text
+  file_name        varchar(255)    // original upload filename
+  file_path        varchar(1000)   // server-side storage (outside web root)
+  file_size        bigint
+  mime_type        varchar(120)
+  checksum_sha256  varchar(64)
+  language         varchar(16)     // ISO 639-1
+  embedding_model  varchar(255)    // model used for current vectors
+  embedding_dim    integer
+  ingestion_status ingestion_status [not null, default: 'received']
+  chunk_count      integer         [not null, default: 0]
+  error_message    text
+  metadata         jsonb
+  created_at       timestamp       [not null, default: `now()`]
+  updated_at       timestamp       [not null, default: `now()`]
+
+  indexes {
+    user_id
+    ingestion_status
+    (user_id, source_type)
+    (user_id, source_type, external_id) [unique] // null external_id allowed (multi-null ok in PG)
+    checksum_sha256
+  }
+}
+
+Table document_chunks {
+  id           uuid            [pk, default: `gen_random_uuid()`]
+  document_id  uuid            [not null, ref: > documents.id]
+  chunk_index  integer         [not null]
+  content      text            [not null] // retained for audit/debug/re-embed
+  token_count  integer
+  char_count   integer
+  page_number  integer
+  section      varchar(255)
+  heading      varchar(500)
+  vector_id    uuid            // Qdrant point id (null until embedded)
+  metadata     jsonb
+  created_at   timestamp       [not null, default: `now()`]
+
+  indexes {
+    document_id
+    (document_id, chunk_index) [unique]
+  }
+}
+
+Table insights {
+  id                uuid            [pk, default: `gen_random_uuid()`]
+  user_id           uuid            [not null, ref: > users.id]
+  research_query_id uuid            [ref: > research_queries.id]
+  project_id        uuid            [ref: > research_projects.id]
+  category          insight_category [not null]
+  title             varchar(500)    [not null]
+  summary           text            [not null]
+  body              text            // full detail when needed
+  confidence        numeric(4, 3)   // 0.000 - 1.000
+  evidence          jsonb           // chunk_id/document_id list + rationale
+  metadata          jsonb           // confidence components etc.
+  created_at        timestamp       [not null, default: `now()`]
+
+  indexes {
+    user_id
+    research_query_id
+    project_id
+    category
+    created_at
+  }
+}
+
+Table trends {
+  id                uuid            [pk, default: `gen_random_uuid()`]
+  user_id           uuid            [not null, ref: > users.id]
+  research_query_id uuid            [ref: > research_queries.id]
+  project_id        uuid            [ref: > research_projects.id]
+  technology        varchar(255)    [not null]
+  trend_score       numeric(5, 2)   [not null] // 0 - 100
+  momentum          varchar(20)     // e.g. emerging/developing/growing/hot
+  signal_scores     jsonb           // {activity, recency, growth, diversity, relations}
+  signal_counts     jsonb           // raw counts behind the scores
+  period_start      date
+  period_end        date
+  evidence          jsonb           // supporting document/chunk references
+  interpretation    text            // Trend Agent narrative
+  created_at        timestamp       [not null, default: `now()`]
+
+  indexes {
+    user_id
+    research_query_id
+    project_id
+    technology
+    (user_id, technology, created_at)
+  }
+}
+
+Table reports {
+  id                uuid            [pk, default: `gen_random_uuid()`]
+  user_id           uuid            [not null, ref: > users.id]
+  research_query_id uuid            [not null, ref: > research_queries.id]
+  project_id        uuid            [ref: > research_projects.id]
+  report_type       report_type     [not null]
+  version           integer         [not null, default: 1]
+  title             varchar(500)
+  content           jsonb           // structured sections[]
+  markdown          text            // rendered export
+  executive_summary text
+  status            varchar(20)     [not null, default: 'generating'] // generating|ready|failed
+  model_used        varchar(120)
+  error_message     text
+  created_at        timestamp       [not null, default: `now()`]
+  updated_at        timestamp       [not null, default: `now()`]
+
+  indexes {
+    user_id
+    research_query_id
+    (research_query_id, version) [unique]
+    created_at
+  }
+}
+
+Table agent_runs {
+  id                 uuid            [pk, default: `gen_random_uuid()`]
+  research_query_id  uuid            [not null, ref: > research_queries.id]
+  agent_name         varchar(120)    [not null] // orchestrator|retrieval|analysis|trend|report|synthesis
+  agent_version      varchar(40)
+  task               text            [not null] // node task description / prompt key
+  input              jsonb
+  retrieved_sources  jsonb           // chunk/document ids used by this node
+  output             jsonb
+  model_used         varchar(120)
+  status             agent_run_status [not null, default: 'running']
+  retry_count        integer         [not null, default: 0]
+  error_message      text
+  started_at         timestamp       [not null, default: `now()`]
+  finished_at        timestamp
+  latency_ms         integer
+  created_at         timestamp       [not null, default: `now()`]
+
+  indexes {
+    research_query_id
+    (research_query_id, agent_name)
+    (research_query_id, started_at)
+    agent_name
+    status
+  }
+}
+
+Table feedback {
+  id                uuid            [pk, default: `gen_random_uuid()`]
+  user_id           uuid            [not null, ref: > users.id]
+  research_query_id uuid            [ref: > research_queries.id]
+  report_id         uuid            [ref: > reports.id]
+  feedback_type     feedback_type   [not null]
+  rating            integer         // 1..5 (check constraint at migration level)
+  comment           text
+  created_at        timestamp       [not null, default: `now()`]
+
+  indexes {
+    user_id
+    research_query_id
+    report_id
+    created_at
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Notes
+// ---------------------------------------------------------------------------
+
+Note 'documents.source_type=user_upload covers plain uploads; imports carry external_id for dedupe.'
+Note 'feedback.rating CHECK 1..5 enforced via Alembic constraint (DBML has no range check).'
+Note 'Qdrant payload mirrors chunk metadata for filtering: user_id, document_id, source_type, publication_year, title, url, section, page_number.'
